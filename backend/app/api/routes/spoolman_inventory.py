@@ -12,13 +12,13 @@ import json
 import logging
 import re
 import time
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, select, text, tuple_, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -65,17 +65,15 @@ from backend.app.schemas.spoolman import (
     check_slot_tray_id,
 )
 from backend.app.schemas.supplier import SpoolSupplierLinkInput
-from backend.app.services import filament_profile_default as profile_defaults, slot_unlink_grace, spool_swaps
-from backend.app.services.ams_assignment_lock import get_spool_move_lock
+from backend.app.services import filament_profile_default as profile_defaults
 from backend.app.services.location_service import (
     enrich_spool_dicts_with_location_id,
     maybe_sync_spoolman_locations,
     resolve_spoolman_location_string,
 )
 from backend.app.services.printer_manager import PrinterManager, printer_manager
-from backend.app.services.slicer_filament_resolver import resolve_slicer_filament, reusable_slot_filament_id
-from backend.app.services.slot_nozzle import resolve_slot_nozzle
-from backend.app.services.spool_filament_preset import forget_spoolman_spool_own_preset, resolve_spoolman_preset
+from backend.app.services.slot_assignment import assign_spoolman_spool
+from backend.app.services.spool_filament_preset import forget_spoolman_spool_own_preset
 from backend.app.services.spoolman import (
     SpoolmanClient,
     SpoolmanClientError,
@@ -87,14 +85,6 @@ from backend.app.services.spoolman import (
 from backend.app.services.spoolman_tracking import get_fallback_spool_tag_for_slot, is_slot_fallback_tag
 from backend.app.services.tag_conflict import tag_already_linked
 from backend.app.utils.color_utils import spoolman_color_hex
-from backend.app.utils.filament_finish import finish_generic_id
-from backend.app.utils.filament_ids import (
-    GENERIC_FILAMENT_IDS,
-    filament_id_to_setting_id,
-    normalize_slicer_filament,
-)
-from backend.app.utils.filament_types import nozzle_temp_range, printer_filament_type, support_filament_type
-from backend.app.utils.tray_ids import external_tray_id
 
 logger = logging.getLogger(__name__)
 
@@ -1895,28 +1885,6 @@ async def sync_spoolman_ams_weights(
     return {"synced": synced, "skipped": skipped, "printing": printing}
 
 
-def _live_slot_tray(state, ams_id: int, tray_id: int) -> dict:
-    """The tray the printer reports for a slot right now, or {} (external: vt_tray 254/255)."""
-    raw = getattr(state, "raw_data", None) if state is not None else None
-    if not isinstance(raw, dict):
-        return {}
-    if ams_id == 255:
-        vt_trays = raw.get("vt_tray") or []
-        for vt in [vt_trays] if isinstance(vt_trays, dict) else vt_trays:
-            if isinstance(vt, dict) and str(vt.get("id", 254)) == str(external_tray_id(tray_id)):
-                return vt
-        return {}
-    units = raw.get("ams") or []
-    if isinstance(units, dict):
-        units = units.get("ams") or []
-    for unit in units if isinstance(units, list) else []:
-        if isinstance(unit, dict) and str(unit.get("id")) == str(ams_id):
-            for tray in unit.get("tray") or []:
-                if isinstance(tray, dict) and str(tray.get("id")) == str(tray_id):
-                    return tray
-    return {}
-
-
 @router.post("/slot-assignments")
 async def assign_spoolman_slot(
     body: SpoolSlotAssignmentRequest,
@@ -1932,407 +1900,20 @@ async def assign_spoolman_slot(
 
     client = await _get_client(db)
     printer_scope.ensure(body.printer_id)
-    result = await db.execute(select(Printer).where(Printer.id == body.printer_id))
-    printer = result.scalar_one_or_none()
-    if not printer:
-        raise HTTPException(status_code=404, detail="Printer not found")
-
-    # Verify the Spoolman spool exists before committing to local DB.
-    # This prevents ghost rows pointing at non-existent spool IDs.
-    async with _translate_spoolman_errors():
-        spool = await client.get_spool(body.spoolman_spool_id)
-    # As the built-in inventory refuses it: an archived spool on a slot would
-    # be charged the next print's usage (SSA-8).
-    if spool.get("archived"):
-        raise HTTPException(status_code=400, detail="Cannot assign an archived spool")
-
-    # A move (#1574) takes the spool out of every other slot it holds, in the
-    # same commit as the upsert below, so a failed move leaves it where it was
-    # instead of in no slot. Its fallback tag for a slot it leaves is cleared
-    # first. Moves of one spool take turns (get_spool_move_lock): on PostgreSQL
-    # a move's DELETE doesn't see the slot another move inserts and commits
-    # after it began, and both left the spool assigned. A slot on a printer
-    # outside the caller's scope stays assigned, as unassigning leaves it
-    # (#1727).
-    target = (body.printer_id, body.ams_id, body.tray_id)
-    slot_columns = (SpoolmanSlotAssignment.printer_id, SpoolmanSlotAssignment.ams_id, SpoolmanSlotAssignment.tray_id)
-    others = [SpoolmanSlotAssignment.spoolman_spool_id == body.spoolman_spool_id, tuple_(*slot_columns) != target]
-    if (in_scope := printer_scope.where_strict(SpoolmanSlotAssignment.printer_id)) is not None:
-        others.append(in_scope)
-    vacated: list[tuple[int, int, int]] = []
-    cleared_tag: str | None = None
-    async with get_spool_move_lock("spoolman", body.spoolman_spool_id) if body.move else nullcontext():
-        if body.move:
-            vacated = list((await db.execute(select(*slot_columns).where(*others))).tuples())
-            cleared_tag = await _clear_vacated_slot_fallback_tag(
-                client, db, spool_id=body.spoolman_spool_id, spool=spool, vacated=vacated
-            )
-
-        # Spool confirmed in Spoolman — upsert into local slot-assignment table
-        # assigned_at is intentionally not refreshed on re-assign (original timestamp preserved)
-        try:
-            if body.move:
-                # Every other slot of the spool, not only those read above: a
-                # link or the AMS sync may have given it one more meanwhile.
-                result = await db.execute(delete(SpoolmanSlotAssignment).where(*others).returning(*slot_columns))
-                vacated = list(result.tuples())
-            await db.execute(
-                text(
-                    "INSERT INTO spoolman_slot_assignments"
-                    " (printer_id, ams_id, tray_id, spoolman_spool_id)"
-                    " VALUES (:printer_id, :ams_id, :tray_id, :spool_id)"
-                    " ON CONFLICT(printer_id, ams_id, tray_id)"
-                    " DO UPDATE SET spoolman_spool_id = excluded.spoolman_spool_id"
-                ),
-                {
-                    "printer_id": body.printer_id,
-                    "ams_id": body.ams_id,
-                    "tray_id": body.tray_id,
-                    "spool_id": body.spoolman_spool_id,
-                },
-            )
-            await spool_swaps.record_assignment(
-                db, body.printer_id, body.ams_id, body.tray_id, body.spoolman_spool_id, spool_swaps.SPOOLMAN
-            )
-            await db.commit()
-            slot_unlink_grace.forget_slot(body.printer_id, body.ams_id, body.tray_id)
-        except Exception as exc:
-            await db.rollback()
-            logger.error("Failed to persist slot assignment: %s", exc)
-            if cleared_tag:
-                # The spool stays in its old slot, so it gets that slot's tag back.
-                try:
-                    await client.merge_spool_extra(body.spoolman_spool_id, {"tag": json.dumps(cleared_tag)})
-                except (SpoolmanClientError, SpoolmanUnavailableError, SpoolmanNotFoundError) as restore_exc:
-                    logger.warning(
-                        "Could not put back the fallback tag of Spoolman spool %s: %s",
-                        body.spoolman_spool_id,
-                        restore_exc,
-                    )
-            raise HTTPException(status_code=500, detail="Failed to save slot assignment") from exc
-    if vacated:
-        logger.info(
-            "Moved Spoolman spool %d to printer %d AMS%d-T%d from %s",
-            body.spoolman_spool_id,
-            body.printer_id,
-            body.ams_id,
-            body.tray_id,
-            ", ".join(f"printer {p} AMS{a}-T{t}" for p, a, t in vacated),
-        )
-    # #1457: clear stale fallback-tag links on OTHER spools still bound to this
-    # slot. Without this, a non-RFID slot's deterministic fallback tag stays
-    # attached to the previous spool in Spoolman's extra.tag and re-surfaces in
-    # the hover card whenever the local slot assignment is removed.
-    if printer.serial_number:
-        await _clear_stale_slot_fallback_tag_links(
-            client,
-            printer_serial=printer.serial_number,
-            ams_id=body.ams_id,
-            tray_id=body.tray_id,
-            keep_spool_id=body.spoolman_spool_id,
-        )
-
-    # Other tabs and the SpoolBuddy kiosk follow slot changes over the
-    # websocket, as the built-in assign announces them: the slots the spool
-    # left, and the one it went to. After the tag clean-up above, which the
-    # pages read back with the slot rows (#3402).
-    await _announce_freed_slots([*vacated, target])
-
-    mapped = _map_spoolman_spool(spool)
-
-    # Fetch K-profiles before the MQTT try block so we can use async DB access.
-    kp_rows_result = await db.execute(
-        select(SpoolmanKProfile).where(
-            SpoolmanKProfile.spoolman_spool_id == body.spoolman_spool_id,
-            SpoolmanKProfile.printer_id == body.printer_id,
-        )
+    mapped = await assign_spoolman_spool(
+        db,
+        client,
+        spoolman_spool_id=body.spoolman_spool_id,
+        printer_id=body.printer_id,
+        ams_id=body.ams_id,
+        tray_id=body.tray_id,
+        move=body.move,
+        printer_scope=printer_scope,
+        current_user=current_user,
+        printer_manager=printer_manager,
+        ws_manager=ws_manager,
+        clear_vacated_fallback_tag=_clear_vacated_slot_fallback_tag,
     )
-    kp_rows = kp_rows_result.scalars().all()
-
-    # Auto-configure AMS slot via MQTT (best-effort; slot assignment is already persisted)
-    try:
-        mqtt_client = printer_manager.get_client(body.printer_id)
-        if mqtt_client:
-            # Spoolman's material is free text, so it arrives as whatever the
-            # user typed there -- "PLA+", "PolyTerra PLA". The sub-brand keeps
-            # that wording; the slot's type has to be one the printer and the
-            # slicer know (issue #2902).
-            material = mapped.get("material") or ""
-            tray_type = printer_filament_type(material)
-            brand = mapped.get("brand") or ""
-            subtype = mapped.get("subtype") or ""
-            if brand:
-                tray_sub_brands = f"{brand} {material} {subtype}".strip()
-            elif subtype:
-                tray_sub_brands = f"{material} {subtype}".strip()
-            else:
-                tray_sub_brands = material
-
-            tray_color = (mapped.get("rgba") or "808080FF").upper()
-            if len(tray_color) == 6:
-                tray_color = tray_color + "FF"
-
-            # Printer state, read here rather than further down because the
-            # per-model preset override below needs the slot's nozzle
-            # diameter and the K-profile cascade further down needs the same
-            # value -- one read, so they cannot disagree. (The previous
-            # `mqtt_client.printer_state` access via hasattr always returned
-            # None -- the attribute is `state`, not `printer_state` -- so the
-            # K-profile cascade silently skipped state.kprofiles, defaulted
-            # nozzle_diameter to 0.4, and left slot_extruder unset.)
-            state = printer_manager.get_status(body.printer_id)
-            slot_nozzle = resolve_slot_nozzle(
-                state, body.ams_id, body.tray_id, printer_manager.get_model(body.printer_id)
-            )
-            nozzle_diameter = slot_nozzle.diameter
-
-            # Per-printer-model preset override, same cascade as internal
-            # mode: a cloud/Orca preset is bound to a model, so one stored
-            # preset per spool is wrong across two models. Returns Spoolman's
-            # own value when no override is set.
-            slot_slicer_filament, slot_slicer_filament_name = await resolve_spoolman_preset(
-                db,
-                spoolman_spool_id=body.spoolman_spool_id,
-                printer_model=printer_manager.get_model(body.printer_id),
-                nozzle_diameter=nozzle_diameter,
-                fallback_filament=mapped.get("slicer_filament"),
-                fallback_name=mapped.get("slicer_filament_name"),
-            )
-
-            # #1713: resolve the spool's stored slicer_filament reference
-            # (cloud preset, local preset, GF-prefix builtin, or numeric
-            # LocalPreset id) to the printer-side tray_info_idx + setting_id.
-            # Previously the Spoolman path dropped slicer_filament on the
-            # floor and only the generic-material fallback fired; the user-
-            # configured profile never reached the printer. Shared with the
-            # internal-mode route via the same helper so the two flows can't
-            # drift again.
-            tray_info_idx, setting_id, sub_brand_override, type_override = await resolve_slicer_filament(
-                db=db,
-                current_user=current_user,
-                slicer_filament=slot_slicer_filament,
-                slicer_filament_name=slot_slicer_filament_name,
-                material=material,
-            )
-            if sub_brand_override:
-                tray_sub_brands = sub_brand_override
-            # A preset carries its own type; the reduction above only infers
-            # one from Spoolman's free-text material. The preset wins when the
-            # spool has one (issue #2902, @doncaruana).
-            if type_override:
-                tray_type = printer_filament_type(type_override)
-            # A support material keeps the slicer's suffix ("PLA-S") (#3559).
-            tray_type = support_filament_type(
-                tray_type, tray_info_idx, f"{slot_slicer_filament_name or ''} {tray_sub_brands}"
-            )
-
-            material_upper = material.upper().strip()
-            # Without a preset, the slot's own filament id where it fits, as in
-            # internal mode, before any generic one (#3433).
-            if not tray_info_idx:
-                current_tray = _live_slot_tray(state, body.ams_id, body.tray_id)
-                tray_info_idx = reusable_slot_filament_id(
-                    current_tray.get("tray_info_idx"),
-                    current_tray.get("tray_type"),
-                    current_tray.get("tray_sub_brands"),
-                    tray_type,
-                    f"{material} {subtype}",
-                )
-            # Fall back to generic-material id when slicer_filament is empty
-            # or the resolver discarded an unresolvable value. Matches the
-            # internal-mode tail in inventory.py:_apply_spool_to_slot_inner,
-            # including the order: the spool's own wording first and the
-            # reduced type only after it, so "PETG HF" keeps its own generic
-            # preset (GFG96) rather than trading it for "PETG"'s GFG99.
-            if not tray_info_idx:
-                tray_info_idx = (
-                    # The finish first, as in internal mode: a Silk spool
-                    # gets Generic PLA Silk.
-                    finish_generic_id(tray_type, f"{material} {subtype}")
-                    or GENERIC_FILAMENT_IDS.get(material_upper)
-                    or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
-                    or GENERIC_FILAMENT_IDS.get(tray_type.upper())
-                    or ""
-                )
-
-            # Ensure setting_id is always derivable from tray_info_idx. The
-            # local-preset path can leave it empty when the LP's setting JSON
-            # has no filament_id and falls through to the generic material id;
-            # without this fallback the slicer gets a half-configured slot
-            # (filament id without setting id) and the slot detail modal
-            # renders empty fields. Same pattern as the internal-mode tail.
-            if tray_info_idx and not setting_id:
-                setting_id = filament_id_to_setting_id(tray_info_idx)
-
-            temp_defaults = nozzle_temp_range(material, tray_type)
-            temp_min = mapped.get("nozzle_temp_min") or temp_defaults[0]
-            temp_max = temp_defaults[1]
-
-            # Pull printer state from printer_manager. The previous
-            # `mqtt_client.printer_state` access via hasattr always returned
-            # None (the attribute is `state`, not `printer_state`), so the
-            # K-profile cascade silently skipped state.kprofiles, defaulted
-            # nozzle_diameter to 0.4, and left slot_extruder unset.
-            slot_extruder = slot_nozzle.extruder
-
-            # Prefer exact extruder match, fall back to extruder-agnostic kp
-            # for the same nozzle. Hard-skipping on mismatch silently dropped
-            # valid stored profiles when the AMS-extruder mapping had shifted.
-            exact_kp = None
-            fallback_kp = None
-            for kp in kp_rows:
-                if kp.nozzle_diameter != nozzle_diameter or kp.cali_idx is None:
-                    continue
-                if not slot_nozzle.flow_matches(kp.nozzle_type):
-                    continue
-                if slot_extruder is not None and kp.extruder is not None and kp.extruder == slot_extruder:
-                    exact_kp = kp
-                    break
-                if fallback_kp is None:
-                    fallback_kp = kp
-            matching_kp = exact_kp or fallback_kp
-
-            # Resolve the printer-side calibration entry by cali_idx so we
-            # know the authoritative filament_id (the printer indexes its
-            # calibration table by filament_id, not setting_id).
-            printer_kp = None
-            if matching_kp and state and state.kprofiles:
-                for pkp in state.kprofiles:
-                    if pkp.slot_id == matching_kp.cali_idx and pkp.nozzle_diameter == nozzle_diameter:
-                        printer_kp = pkp
-                        break
-                if printer_kp is None:
-                    logger.warning(
-                        "Spoolman assign: cali_idx=%d not present in printer's "
-                        "calibration table — stored kp may be stale.",
-                        matching_kp.cali_idx,
-                    )
-
-            # Realign the slot's filament context (tray_info_idx + setting_id)
-            # to the kp's calibration context. Without this, ams_filament_setting
-            # declares the slot under generic PLA while extrusion_cali_sel points
-            # the cali_idx at a different preset — the printer can't link them
-            # and falls back to the default profile. P-prefix local presets are
-            # valid for tray_info_idx; PFUS-prefix cloud-user presets are not
-            # (the slicer rejects them).
-            effective_tray_info_idx = tray_info_idx
-            effective_setting_id = setting_id
-            if printer_kp and printer_kp.filament_id:
-                if not printer_kp.filament_id.startswith("PFUS"):
-                    effective_tray_info_idx = printer_kp.filament_id
-                if printer_kp.setting_id:
-                    effective_setting_id = printer_kp.setting_id
-            elif matching_kp and matching_kp.setting_id:
-                derived = normalize_slicer_filament(matching_kp.setting_id)[0]
-                if derived and not derived.startswith("PFUS"):
-                    effective_tray_info_idx = derived
-                effective_setting_id = matching_kp.setting_id
-            if effective_tray_info_idx != tray_info_idx or effective_setting_id != setting_id:
-                logger.info(
-                    "Spoolman assign: realigning tray_info_idx %r → %r, setting_id %r → %r (kp_id=%s, source=%s)",
-                    tray_info_idx,
-                    effective_tray_info_idx,
-                    setting_id,
-                    effective_setting_id,
-                    matching_kp.id if matching_kp else None,
-                    "printer" if printer_kp else "stored",
-                )
-
-            mqtt_client.ams_set_filament_setting(
-                ams_id=body.ams_id,
-                tray_id=body.tray_id,
-                tray_info_idx=effective_tray_info_idx,
-                tray_type=tray_type,
-                tray_sub_brands=tray_sub_brands,
-                tray_color=tray_color,
-                nozzle_temp_min=temp_min,
-                nozzle_temp_max=temp_max,
-                setting_id=effective_setting_id,
-            )
-
-            if matching_kp and matching_kp.cali_idx is not None:
-                # Use printer-reported filament_id when available, otherwise
-                # fall back to the realigned tray_info_idx so both commands
-                # reference the same filament context.
-                cali_filament_id = (
-                    printer_kp.filament_id if printer_kp and printer_kp.filament_id else None
-                ) or effective_tray_info_idx
-                mqtt_client.extrusion_cali_sel(
-                    ams_id=body.ams_id,
-                    tray_id=body.tray_id,
-                    cali_idx=matching_kp.cali_idx,
-                    filament_id=cali_filament_id,
-                    nozzle_diameter=nozzle_diameter,
-                )
-                logger.info(
-                    "Spoolman assign: applied K-profile cali_idx=%d "
-                    "(kp_id=%d, filament_id=%s) for spool %d on printer %d AMS%d-T%d",
-                    matching_kp.cali_idx,
-                    matching_kp.id,
-                    cali_filament_id,
-                    body.spoolman_spool_id,
-                    body.printer_id,
-                    body.ams_id,
-                    body.tray_id,
-                )
-            else:
-                # No stored K-profile for this spool — always reset the slot to
-                # Default K (cali_idx=-1). The live cali_idx belongs to whatever
-                # filament was there before, so preserving it would apply the
-                # wrong filament's calibration to the new spool.
-                mqtt_client.extrusion_cali_sel(
-                    ams_id=body.ams_id,
-                    tray_id=body.tray_id,
-                    cali_idx=-1,
-                    filament_id=effective_tray_info_idx,
-                    nozzle_diameter=nozzle_diameter,
-                )
-                logger.info(
-                    "No stored K-profile for Spoolman spool %d — reset slot to Default K (cali_idx=-1)",
-                    body.spoolman_spool_id,
-                )
-
-            # Read-back verification, as the built-in assign registers it (#2582):
-            # the AMS pushes that follow confirm the tray took what was sent.
-            # Not for a slot the firmware calls empty, which echoes nothing
-            # back until a spool goes in (the built-in check, inventory.py).
-            from backend.app.api.routes.inventory import _find_tray_in_ams_data  # noqa: PLC0415
-            from backend.app.services.ams_slot_presence import spool_present  # noqa: PLC0415
-
-            live_tray = None
-            if state and state.raw_data:
-                ams_raw = state.raw_data.get("ams", [])
-                if isinstance(ams_raw, dict):
-                    ams_raw = ams_raw.get("ams", [])
-                live_tray = _find_tray_in_ams_data(ams_raw, body.ams_id, body.tray_id)
-            tray_state = (live_tray or {}).get("state")
-            if not (spool_present(live_tray) is not True and tray_state in (9, 10)):
-                mqtt_client.register_assignment_verification(
-                    ams_id=body.ams_id,
-                    tray_id=body.tray_id,
-                    tray_info_idx=effective_tray_info_idx,
-                    tray_color=tray_color,
-                    cali_idx=matching_kp.cali_idx if matching_kp and matching_kp.cali_idx is not None else -1,
-                )
-                # Fresh telemetry for the check to compare against.
-                mqtt_client.request_status_update()
-
-            logger.info(
-                "Auto-configured AMS slot ams=%d tray=%d for Spoolman spool %d on printer %d",
-                body.ams_id,
-                body.tray_id,
-                body.spoolman_spool_id,
-                body.printer_id,
-            )
-    except Exception:
-        logger.exception(
-            "Failed to auto-configure AMS slot for Spoolman spool %d (printer=%d, ams=%d, tray=%d)",
-            body.spoolman_spool_id,
-            body.printer_id,
-            body.ams_id,
-            body.tray_id,
-        )
-
     return mapped
 
 
